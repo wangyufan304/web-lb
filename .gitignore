@@ -1,0 +1,15 @@
+bin/*
+.idea
+.vscode
+dpdk/dpdk-stable-20.11.1/*
+dpdk/dpdklib/
+# 保留 bin/ 目录本身（可选）
+!bin/
+
+# 忽略编译生成的临时文件和其他常见的忽略项
+*.o
+*.a
+*.out
+*.so
+*.exe
+*.log
