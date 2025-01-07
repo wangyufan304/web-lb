@@ -76,8 +76,8 @@ static struct pkt_type *pkt_type_get(__be16 type, struct nic_port *port)
     }
     return NULL;
 }
-// 发送 ICMP Echo Reply
 int send_ping_reply(struct rte_mbuf *req_mbuf, struct nic_port *port) {
+    // 获取请求数据包的 Ethernet 和 IP 头部
     struct rte_ether_hdr *eth_hdr_req = rte_pktmbuf_mtod(req_mbuf, struct rte_ether_hdr *);
     struct rte_ipv4_hdr *ip_hdr_req = (struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(req_mbuf, uint8_t *) + sizeof(struct rte_ether_hdr));
     struct rte_icmp_hdr *icmp_hdr_req = (struct rte_icmp_hdr *)((uint8_t *)ip_hdr_req + (ip_hdr_req->version_ihl & 0x0f) * 4);
@@ -98,35 +98,43 @@ int send_ping_reply(struct rte_mbuf *req_mbuf, struct nic_port *port) {
     // 填充 IP header
     struct rte_ipv4_hdr *ip_hdr_reply = (struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(reply_mbuf, uint8_t *) + sizeof(struct rte_ether_hdr));
     memset(ip_hdr_reply, 0, sizeof(struct rte_ipv4_hdr));
-    ip_hdr_reply->version_ihl = 0X45;
-    ip_hdr_reply->type_of_service=0;
+    ip_hdr_reply->version_ihl = 0x45;
+    ip_hdr_reply->type_of_service = 0;
     ip_hdr_reply->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_icmp_hdr) + rte_pktmbuf_pkt_len(req_mbuf) - sizeof(struct rte_ether_hdr));
     ip_hdr_reply->time_to_live = 64;
     ip_hdr_reply->next_proto_id = IPPROTO_ICMP;
     ip_hdr_reply->src_addr = ip_hdr_req->dst_addr;  // Source -> Destination
     ip_hdr_reply->dst_addr = ip_hdr_req->src_addr;  // Destination -> Source
-    ip_hdr_reply->packet_id = 0 ;
+    ip_hdr_reply->packet_id = 0;
     ip_hdr_reply->hdr_checksum = 0;
-    ip_hdr_reply->hdr_checksum = rte_ipv4_cksum(ip_hdr_reply);
+    ip_hdr_reply->hdr_checksum = rte_ipv4_cksum(ip_hdr_reply);  // 计算 IP 校验和
 
     // 填充 ICMP header
     struct rte_icmp_hdr *icmp_hdr_reply = (struct rte_icmp_hdr *)((uint8_t *)ip_hdr_reply + sizeof(struct rte_ipv4_hdr));
     memset(icmp_hdr_reply, 0, sizeof(struct rte_icmp_hdr));
-    icmp_hdr_reply->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
+    icmp_hdr_reply->icmp_type = RTE_IP_ICMP_ECHO_REPLY;  // 设置为 Echo Reply 类型
     icmp_hdr_reply->icmp_code = 0;
-    icmp_hdr_reply->icmp_ident = icmp_hdr_req->icmp_ident;
-    icmp_hdr_reply->icmp_seq_nb = icmp_hdr_req->icmp_seq_nb;
+    icmp_hdr_reply->icmp_ident = icmp_hdr_req->icmp_ident;  // 使用相同的 ID
+    icmp_hdr_reply->icmp_seq_nb = icmp_hdr_req->icmp_seq_nb;  // 使用相同的序列号
 
     // 计算 ICMP 校验和
-    uint16_t icmp_checksum = rte_ipv4_udptcp_cksum(ip_hdr_reply,icmp_hdr_reply);
-    icmp_hdr_reply->icmp_cksum = rte_cpu_to_be_16(icmp_checksum);
+    uint16_t icmp_checksum = rte_ipv4_udptcp_cksum(ip_hdr_reply, icmp_hdr_reply);
+    icmp_hdr_reply->icmp_cksum = rte_cpu_to_be_16(icmp_checksum);  // 设置 ICMP 校验和
+
+    // 设置数据包的长度
+    uint16_t ip_header_len = sizeof(struct rte_ipv4_hdr);
+    uint16_t icmp_header_len = sizeof(struct rte_icmp_hdr);
+    uint16_t total_len = ip_header_len + icmp_header_len + rte_pktmbuf_pkt_len(req_mbuf) - sizeof(struct rte_ether_hdr);
+
+    reply_mbuf->pkt_len = total_len;
+    reply_mbuf->data_len = total_len - sizeof(struct rte_ether_hdr);  // 数据部分从 Ethernet header 后开始
+
+    rte_pktmbuf_dump(stdout, reply_mbuf, 64);  // 打印数据包内容
 
     // 发送 ICMP Echo Reply 数据包
-    struct hz_queue_conf *txcq =  hz_lcore_conf[rte_lcore_id()].in->tx;
-    txcq->len = reply_mbuf->pkt_len;
-    int sent = rte_eth_tx_burst(1, 1, &reply_mbuf,1) ;  // 发送到网卡的第一个队列
+    int sent = rte_eth_tx_burst(port->pid, rte_lcore_id(), &reply_mbuf, 1);  // 发送到网卡的第一个队列
     if (sent == 0) {
-        printf("Failed to send ping reply:%s\n", rte_strerror(rte_errno));
+        printf("Failed to send ping reply: %s\n", rte_strerror(rte_errno));
         rte_pktmbuf_free(reply_mbuf);
         return -1;
     }
@@ -134,6 +142,7 @@ int send_ping_reply(struct rte_mbuf *req_mbuf, struct nic_port *port) {
     printf("Ping reply sent successfully\n");
     return 0;
 }
+
 
 #define PRINT_PACKET_HEADER(mbuf) \
     printf("Packet size: %d\n", rte_pktmbuf_pkt_len(mbuf)); \
