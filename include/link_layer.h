@@ -4,10 +4,11 @@
 #include "common.h"
 #include "global_data.h"
 #include "dpdk.h"
+#include "list.h"
 /*
    cpu lcore conf: id, type, nports.
 */
-
+struct nic_port;
 struct nic_queue_conf
 {
   queueid_t id;
@@ -53,8 +54,19 @@ struct  hz_lcore_conf{
     struct hz_port_conf *in;
     struct hz_port_conf *out;
 };
+struct pkt_type {
+    uint16_t type; /* htons(ether-type) */
+    struct  nic_port*port; /* NULL for wildcard */
+    int (*func)(struct rte_mbuf *mbuf, struct nic_port *port);
+    struct list_head list;
+} __rte_cache_aligned;
 
-
+typedef enum {
+    ETH_PKT_HOST,
+    ETH_PKT_BROADCAST,
+    ETH_PKT_MULTICAST,
+    ETH_PKT_OTHERHOST,
+} eth_type_t;
 int link_layer_init(void);
 int link_layer_term(void);
 void link_layer_init_port(portid_t pid,int nrx,int ntx);

@@ -5,7 +5,8 @@
 #include "schedule.h"
 #include "link_layer.h"
 #include "tools.h"
-
+#include "nic.h"
+#include "netif_addr.h"
 #define LINK_LAYER_PKTPOOL_NB_MBUF_DEF 65535
 #define LINK_LAYER_PKTPOOL_MBUF_CACHE_DEF 256
 
@@ -14,7 +15,9 @@ int link_layer_pktpool_mbuf_cache = LINK_LAYER_PKTPOOL_MBUF_CACHE_DEF;
 
 struct rte_mempool *hzpktmbuf_pool[WLB_MAX_SOCKET];
 static struct cpu_lcore_conf lcore_conf[WLB_MAX_LCORE + 1];
+static struct nic_lcore_stats lcore_stats[WLB_MAX_LCORE];
 static struct hz_lcore_conf hz_lcore_conf[8];
+static struct pkt_type *hz_pkt_types[WLB_MAX_NIC_PORTS][WLB_MAX_ETH_TYPE];
 
 static void print_ether_addr(struct rte_ether_addr *addr) {
     // 使用 printf 打印以太网地址，格式为 XX:XX:XX:XX:XX:XX
@@ -41,73 +44,204 @@ link_layer_hzpktbuf_pool_init(void) {
     }
 }
 
-void link_layer_init_port(portid_t pid, int nrx, int ntx) {
-    // 获取可用的以太网设备数量
-    uint16_t nb_sys_ports = rte_eth_dev_count_avail(); //
-    if (nb_sys_ports == 0) {
-        rte_exit(EXIT_FAILURE, "No Supported eth found\n");
-    }
-    assert(pid<nb_sys_ports);
+static inline eth_type_t eth_type_parse(const struct rte_ether_hdr *eth_hdr,
+                                        const struct nic_port *dev)
+{
+    if (eth_addr_equal(&dev->addr, &eth_hdr->d_addr))
+        return ETH_PKT_HOST;
 
-    // 检索以太网设备的上下文信息
-    struct rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(pid, &dev_info); //
-    printf("%d port: rx-%d,tx_%d",pid,dev_info.max_rx_queues,dev_info.max_tx_queues);
-    struct rte_eth_conf port_conf = {
-            .rxmode = { .mq_mode = ETH_MQ_RX_RSS }, // 启用 RSS 模式
-            .rx_adv_conf.rss_conf = {
-                    .rss_key = NULL, // 使用默认 RSS key
-                    .rss_hf = ETH_RSS_IP | ETH_RSS_TCP | ETH_RSS_UDP, // 配置 RSS 支持的协议
-            }
-    };
-
-    struct rte_eth_rxconf rx_conf = {
-
-    };
-    rte_eth_dev_configure(pid, nrx, ntx, &port_conf);
-
-    //分配并设置以太网设备的接收队列。
-    for (int i = 0; i < nrx; i++) {
-        if (rte_eth_rx_queue_setup(pid, i, 1024,
-                                   rte_eth_dev_socket_id(pid), NULL, hzpktmbuf_pool[rte_eth_dev_socket_id(pid)]) < 0) {
-
-            rte_exit(EXIT_FAILURE, "Could not setup RX queue\n");
-        }
+    if (rte_is_multicast_ether_addr(&eth_hdr->d_addr)) {
+        if (rte_is_broadcast_ether_addr(&eth_hdr->d_addr))
+            return ETH_PKT_BROADCAST;
+        else
+            return ETH_PKT_MULTICAST;
     }
 
-    struct rte_eth_txconf txq_conf = dev_info.default_txconf;
-    txq_conf.offloads = port_conf.rxmode.offloads;
-    if (rte_eth_tx_queue_setup(pid, 0, 1024,
-                               rte_eth_dev_socket_id(pid), &txq_conf) < 0) {
-
-        rte_exit(EXIT_FAILURE, "Could not setup TX queue\n");
-
-    }
-    //启动以太网设备
-    if (rte_eth_dev_start(pid) < 0) {
-        rte_exit(EXIT_FAILURE, "Could not start\n");
-    }
-
-
+    return ETH_PKT_OTHERHOST;
 }
-
-
 static inline uint16_t link_layer_rx_burst(portid_t pid, struct hz_queue_conf *qconf) {
 
     int nrx = 0;
     nrx = rte_eth_rx_burst(pid, rte_lcore_id(), qconf->mbufs, 1024);
     qconf->len = nrx;
-//    printf("(%d-%d-%d)\t",rte_lcore_id(),qconf->id,nrx);
     return nrx;
 }
+static struct pkt_type *pkt_type_get(__be16 type, struct nic_port *port)
+{
+    for(int i=0;i<NIC_MAX_RTE_PORT;i++)
+       for(int j = 0;j<WLB_MAX_ETH_TYPE;j++){
+        if(hz_pkt_types[i][j]!=NULL&&hz_pkt_types[i][j]->port->pid ==port->pid&&hz_pkt_types[i][j]->type==type){
+            return hz_pkt_types[i][j];
+        }
+    }
+    return NULL;
+}
+// 发送 ICMP Echo Reply
+int send_ping_reply(struct rte_mbuf *req_mbuf, struct nic_port *port) {
+    struct rte_ether_hdr *eth_hdr_req = rte_pktmbuf_mtod(req_mbuf, struct rte_ether_hdr *);
+    struct rte_ipv4_hdr *ip_hdr_req = (struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(req_mbuf, uint8_t *) + sizeof(struct rte_ether_hdr));
+    struct rte_icmp_hdr *icmp_hdr_req = (struct rte_icmp_hdr *)((uint8_t *)ip_hdr_req + (ip_hdr_req->version_ihl & 0x0f) * 4);
 
+    // 创建新的回复数据包
+    struct rte_mbuf *reply_mbuf = rte_pktmbuf_alloc(port->mbuf_pool);
+    if (!reply_mbuf) {
+        printf("Failed to allocate mbuf for ping reply\n");
+        return -1;
+    }
+
+    // 填充 Ethernet header
+    struct rte_ether_hdr *eth_hdr_reply = rte_pktmbuf_mtod(reply_mbuf, struct rte_ether_hdr *);
+    rte_ether_addr_copy(&eth_hdr_req->d_addr, &eth_hdr_reply->s_addr);  // Source MAC -> Destination MAC
+    rte_ether_addr_copy(&eth_hdr_req->s_addr, &eth_hdr_reply->d_addr);  // Destination MAC -> Source MAC
+    eth_hdr_reply->ether_type = rte_be_to_cpu_16(RTE_ETHER_TYPE_IPV4);
+
+    // 填充 IP header
+    struct rte_ipv4_hdr *ip_hdr_reply = (struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(reply_mbuf, uint8_t *) + sizeof(struct rte_ether_hdr));
+    memset(ip_hdr_reply, 0, sizeof(struct rte_ipv4_hdr));
+    ip_hdr_reply->version_ihl = 0X45;
+    ip_hdr_reply->type_of_service=0;
+    ip_hdr_reply->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_icmp_hdr) + rte_pktmbuf_pkt_len(req_mbuf) - sizeof(struct rte_ether_hdr));
+    ip_hdr_reply->time_to_live = 64;
+    ip_hdr_reply->next_proto_id = IPPROTO_ICMP;
+    ip_hdr_reply->src_addr = ip_hdr_req->dst_addr;  // Source -> Destination
+    ip_hdr_reply->dst_addr = ip_hdr_req->src_addr;  // Destination -> Source
+    ip_hdr_reply->packet_id = 0 ;
+    ip_hdr_reply->hdr_checksum = 0;
+    ip_hdr_reply->hdr_checksum = rte_ipv4_cksum(ip_hdr_reply);
+
+    // 填充 ICMP header
+    struct rte_icmp_hdr *icmp_hdr_reply = (struct rte_icmp_hdr *)((uint8_t *)ip_hdr_reply + sizeof(struct rte_ipv4_hdr));
+    memset(icmp_hdr_reply, 0, sizeof(struct rte_icmp_hdr));
+    icmp_hdr_reply->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
+    icmp_hdr_reply->icmp_code = 0;
+    icmp_hdr_reply->icmp_ident = icmp_hdr_req->icmp_ident;
+    icmp_hdr_reply->icmp_seq_nb = icmp_hdr_req->icmp_seq_nb;
+
+    // 计算 ICMP 校验和
+    uint16_t icmp_checksum = rte_ipv4_udptcp_cksum(ip_hdr_reply,icmp_hdr_reply);
+    icmp_hdr_reply->icmp_cksum = rte_cpu_to_be_16(icmp_checksum);
+
+    // 发送 ICMP Echo Reply 数据包
+    struct hz_queue_conf *txcq =  hz_lcore_conf[rte_lcore_id()].in->tx;
+    txcq->len = reply_mbuf->pkt_len;
+    int sent = rte_eth_tx_burst(1, 1, &reply_mbuf,1) ;  // 发送到网卡的第一个队列
+    if (sent == 0) {
+        printf("Failed to send ping reply:%s\n", rte_strerror(rte_errno));
+        rte_pktmbuf_free(reply_mbuf);
+        return -1;
+    }
+
+    printf("Ping reply sent successfully\n");
+    return 0;
+}
+
+#define PRINT_PACKET_HEADER(mbuf) \
+    printf("Packet size: %d\n", rte_pktmbuf_pkt_len(mbuf)); \
+    printf("Ethernet header:\n"); \
+    struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *); \
+    printf("    Src MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", \
+            eth_hdr->s_addr.addr_bytes[0], eth_hdr->s_addr.addr_bytes[1], \
+            eth_hdr->s_addr.addr_bytes[2], eth_hdr->s_addr.addr_bytes[3], \
+            eth_hdr->s_addr.addr_bytes[4], eth_hdr->s_addr.addr_bytes[5]); \
+    printf("    Dst MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", \
+            eth_hdr->d_addr.addr_bytes[0], eth_hdr->d_addr.addr_bytes[1], \
+            eth_hdr->d_addr.addr_bytes[2], eth_hdr->d_addr.addr_bytes[3], \
+            eth_hdr->d_addr.addr_bytes[4], eth_hdr->d_addr.addr_bytes[5]);
+static int
+link_layer_rcv_mbuf(struct nic_port * dev,lcoreid_t cid,struct rte_mbuf * mbuf) {
+    struct rte_ether_hdr *eth_hdr;
+    struct pkt_type *pt;
+    int err;
+    uint16_t data_off;
+    eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+//    print_ether_addr(&eth_hdr->s_addr);
+//    printf("%d-%d\n", rte_cpu_to_be_16(eth_hdr->ether_type),RTE_ETHER_TYPE_IPV4);
+
+    if(rte_cpu_to_be_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_IPV4){
+        PRINT_PACKET_HEADER(mbuf);
+
+        // 获取IP头部
+        struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(mbuf, uint8_t *) + sizeof(struct rte_ether_hdr));
+        if (ip_hdr->next_proto_id != IPPROTO_ICMP) {
+            printf("Not an ICMP packet\n");
+            return -1;
+        }
+        // 获取ICMP头部
+        struct rte_icmp_hdr *icmp_hdr = (struct rte_icmp_hdr *)((uint8_t *)ip_hdr + (ip_hdr->version_ihl & 0x0f) * 4);
+        printf("ICMP Packet: Type: %d, Code: %d\n", icmp_hdr->icmp_type, icmp_hdr->icmp_code);
+
+        if (icmp_hdr->icmp_type == RTE_IP_ICMP_ECHO_REQUEST) {
+            printf("Ping Request (Echo Request):\n");
+            printf("    Identifier: %d\n", ntohs(icmp_hdr->icmp_ident));
+            printf("    Sequence Number: %d\n", ntohs(icmp_hdr->icmp_seq_nb));
+            send_ping_reply(mbuf, dev);
+        } else if (icmp_hdr->icmp_type == RTE_IP_ICMP_ECHO_REPLY) {
+            printf("Ping Reply (Echo Reply):\n");
+            printf("    Identifier: %d\n", ntohs(icmp_hdr->icmp_ident));
+            printf("    Sequence Number: %d\n", ntohs(icmp_hdr->icmp_seq_nb));
+        } else {
+            printf("Unknown ICMP Type: %d\n", icmp_hdr->icmp_type);
+        }
+
+    }
+    pt = pkt_type_get(eth_hdr->ether_type, dev);
+    if (NULL == pt) {
+        goto drop;
+    }
+    mbuf->l2_len = sizeof(struct rte_ether_hdr);
+
+    data_off = mbuf->data_off;
+    if (unlikely(NULL == rte_pktmbuf_adj(mbuf, sizeof(struct rte_ether_hdr))))
+        goto drop;
+
+    if(eth_hdr->ether_type == RTE_ETHER_TYPE_IPV4){
+        PRINT_PACKET_HEADER(mbuf);
+
+        // 获取IP头部
+        struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(mbuf, uint8_t *) + sizeof(struct rte_ether_hdr));
+        if (ip_hdr->next_proto_id != IPPROTO_ICMP) {
+            printf("Not an ICMP packet\n");
+            return -1;
+        }
+
+    }
+drop:
+    rte_pktmbuf_free(mbuf);
+    lcore_stats[cid].dropped++;
+    return EWLB_DROP;
+}
+static int
+link_layer_deliver_mbuf(struct nic_port * dev,lcoreid_t cid,struct rte_mbuf * mbuf){
+    int ret = EWLB_OK;
+    struct rte_ether_hdr *eth_hdr;
+
+    assert(mbuf->port <= NIC_MAX_RTE_PORT);
+    assert(dev != NULL);
+
+    eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+    /* reuse mbuf.packet_type, it was RTE_PTYPE_XXX */
+    mbuf->packet_type = eth_type_parse(eth_hdr, dev);
+    return link_layer_rcv_mbuf(dev, cid, mbuf);
+}
 static void lcore_process_packets(struct rte_mbuf **mbufs, lcoreid_t cid, uint16_t count) {
-
-    for (int i = 0; i < count; i++) {
-        struct rte_mbuf *mbuf = mbufs[i];
-        struct rte_ether_hdr *eth_hdr;
-        eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr*);
-        print_ether_addr(&eth_hdr->s_addr);
+    int i,j;
+    for(j = 0;j<count;++j){
+        rte_prefetch0(rte_pktmbuf_mtod(mbufs[j],void*));
+    }
+    for(i = 0;i<count;i++){
+        struct  rte_mbuf *mbuf = mbufs[i];
+        struct nic_port *dev = get_nic_ports(mbuf->port);
+        if(unlikely(!dev)){
+            rte_pktmbuf_free(mbuf);
+            lcore_stats[cid].dropped++;
+            continue;
+        }
+        mbuf->tx_offload = 0;
+        if(j <count){
+            rte_prefetch0(rte_pktmbuf_mtod(mbufs[j],void*));
+            j++;
+        }
+        link_layer_deliver_mbuf(dev,cid,mbuf);
     }
 
 }
@@ -141,9 +275,9 @@ static void lcore_job_recv_fwd(void *arg) {
 //    }
 //    nrx = rte_eth_rx_burst(hz_lcore_conf[cid].in.id, hz_lcore_conf[cid].in.rx.id,mbuf, 1024);
 //    lcore_process_packets(hz_lcore_conf[cid].in.rx.mbufs, cid, hz_lcore_conf[cid].in.rx.len);
-        pid = hz_lcore_conf[cid].in->id;
-        hz_lcore_conf[cid].in->rx->len=link_layer_rx_burst(pid, hz_lcore_conf[cid].in->rx);
-        lcore_process_packets(hz_lcore_conf[cid].in->rx->mbufs, cid, hz_lcore_conf[cid].in->rx->len);
+    pid = hz_lcore_conf[cid].in->id;
+    hz_lcore_conf[cid].in->rx->len = link_layer_rx_burst(pid, hz_lcore_conf[cid].in->rx);
+    lcore_process_packets(hz_lcore_conf[cid].in->rx->mbufs, cid, hz_lcore_conf[cid].in->rx->len);
 }
 
 
@@ -214,13 +348,13 @@ link_layer_init(void) {
                 lcore_conf[i].pqs[j].rx_queues[jj].id = qid;
                 for (int jjj = 0; jjj < NIC_MAX_PKT_BURST; jjj++) {
                     lcore_conf[i].pqs[j].rx_queues[jj].mbufs[jjj] = rte_pktmbuf_alloc(hzpktmbuf_pool[0]);
-                    assert(lcore_conf[i].pqs[j].rx_queues[jj].mbufs[jjj]!=NULL);
+                    assert(lcore_conf[i].pqs[j].rx_queues[jj].mbufs[jjj] != NULL);
                 }
             }
             for (int jj = 0; jj < lcore_conf[i].pqs[j].ntx_queue; jj++) {
                 for (int jjj = 0; jjj < NIC_MAX_PKT_BURST; jjj++) {
                     lcore_conf[i].pqs[j].tx_queues[jj].mbufs[jjj] = rte_pktmbuf_alloc(hzpktmbuf_pool[0]);
-                    assert(lcore_conf[i].pqs[j].tx_queues[jj].mbufs[jjj]!=NULL);
+                    assert(lcore_conf[i].pqs[j].tx_queues[jj].mbufs[jjj] != NULL);
                 }
             }
         }
@@ -228,20 +362,25 @@ link_layer_init(void) {
     }
     lcore_conf[0].type = LCORE_ROLE_MASTER;
     g_lcore_role[0] = LCORE_ROLE_MASTER;
-    for(int i=0;i<8;i++){
-        hz_lcore_conf[i].id=i;
+    for (int i = 0; i < 8; i++) {
+        hz_lcore_conf[i].id = i;
         hz_lcore_conf[i].type = LCORE_ROLE_FWD_WORKER;
 //        hz_lcore_conf[i].in.id=1;
 //        hz_lcore_conf[i].out.id=0;
 //        hz_lcore_conf[i].in.rx.id=i;
 //        hz_lcore_conf[i].in.rx.len=0;
-        hz_lcore_conf[i].in = rte_malloc("hz_port_conf",sizeof(struct hz_port_conf),0);
-        hz_lcore_conf[i].in->rx = rte_malloc("hz_queue_conf",sizeof(struct hz_queue_conf),0);
-        hz_lcore_conf[i].in->id=1;
-        hz_lcore_conf[i].in->rx->len=0;
-        hz_lcore_conf[i].in->rx->id=i;
-        for(int j = 0;j<1024;j++){
-            hz_lcore_conf[i].in->rx->mbufs[j]=NULL;
+        hz_lcore_conf[i].in = rte_malloc("hz_port_conf", sizeof(struct hz_port_conf), 0);
+        hz_lcore_conf[i].in->rx = rte_malloc("hz_queue_conf", sizeof(struct hz_queue_conf), 0);
+        hz_lcore_conf[i].in->id = 1;
+        hz_lcore_conf[i].in->rx->len = 0;
+        hz_lcore_conf[i].in->rx->id = i;
+        hz_lcore_conf[i].in->tx = rte_malloc("hz_queue_conf", sizeof(struct hz_queue_conf), 0);
+        hz_lcore_conf[i].in->id = 1;
+        hz_lcore_conf[i].in->tx->len = 0;
+        hz_lcore_conf[i].in->tx->id = i;
+        for (int j = 0; j < 1024; j++) {
+            hz_lcore_conf[i].in->rx->mbufs[j] = NULL;
+            hz_lcore_conf[i].in->tx->mbufs[j] = NULL;
         }
     }
 
@@ -250,9 +389,11 @@ link_layer_init(void) {
         assert(err >= 0);
     }
 
-
-
-
+    for(int i=0;i<WLB_MAX_NIC_PORTS;i++){
+        for(int j=0;j<WLB_MAX_ETH_TYPE;j++){
+            hz_pkt_types[i][j]=NULL;
+        }
+    }
     return EWLB_OK;
 }
 

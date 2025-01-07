@@ -10,11 +10,13 @@
 #include "common.h"
 #include "pidfile.h"
 #include "schedule.h"
+#include "nic.h"
 
 #define WLB_MODULES                                      \
 {                                                        \
     WLB_MODULE(MODULE_SCHEDULER,    "wlb scheduler",     wlb_scheduler_init, wlb_scheduler_term), \
     WLB_MODULE(MODULE_LINK_LAYER,   "wlb link layer",    link_layer_init,    link_layer_term), \
+    WLB_MODULE(MODULE_NIC_PORT_LAYER,   "nic port init",    nic_port_init,    nic_port_term), \
     WLB_MODULE(MODULE_LAST,         "last",              NULL,               NULL)                 \
 }
 
@@ -103,6 +105,10 @@ static void modules_term(void) {
 
 int main(int argc, char *argv[]) {
     unsigned lcore_id;
+    int nports;
+    int err;
+    struct nic_port *dev;
+    portid_t pid;
     if (wlb_running(wlb_pid_file)) {
         fprintf(stderr, "wlb is already running\n");
         exit(EXIT_FAILURE);
@@ -119,8 +125,17 @@ int main(int argc, char *argv[]) {
     }else{
         fprintf(stdout, "set_all_thread_affinity success\n");
     }
-    link_layer_init_port(0,8,8);
-    link_layer_init_port(1,8,8);
+    nports = rte_eth_dev_count_avail();
+    for(pid = 0;pid<nports;pid++){
+        dev = get_nic_ports(pid);
+        if(dev == NULL){
+            continue;
+        }
+        err = nic_port_start(dev);
+        if(err!=EWLB_OK){
+            printf("START ERROR %s\n",dev->nic_name);
+        }
+    }
     printf("port init successfully!\n");
     wlb_lcore_start(1);
     wlb_lcore_start(0);
