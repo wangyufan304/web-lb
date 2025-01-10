@@ -8,10 +8,11 @@ static struct list_head wlb_lcore_jobs[LCORE_ROLE_MAX];
 
 
 static inline void
-do_lcore_job(struct wlb_lcore_job *job){
-    if(job)
+do_lcore_job(struct wlb_lcore_job *job) {
+    if (job)
         job->func(job->data);
 }
+
 static void print_ether_addr(struct rte_ether_addr *addr) {
     // 使用 printf 打印以太网地址，格式为 XX:XX:XX:XX:XX:XX
     printf("MAC Address: ");
@@ -34,8 +35,7 @@ wlb_job_loop(__rte_unused void *argv) {
         return EWLB_RETURN;
     }
     while (1) {
-        /* code */
-        list_for_each_entry(job,&wlb_lcore_jobs[role],list){
+        list_for_each_entry(job, &wlb_lcore_jobs[role], list) {
             do_lcore_job(job);
         }
     }
@@ -44,7 +44,7 @@ wlb_job_loop(__rte_unused void *argv) {
 
 int wlb_lcore_job_register(struct wlb_lcore_job *lcore_job, wlb_cpu_lcore_role_t role) {
     struct wlb_lcore_job *cur;
-    if(unlikely(NULL==lcore_job)||role>=LCORE_ROLE_MAX){
+    if (unlikely(NULL == lcore_job) || role >= LCORE_ROLE_MAX) {
         return EWLB_INVAL;
     }
     list_for_each_entry(cur, &wlb_lcore_jobs[role], list) {
@@ -56,12 +56,12 @@ int wlb_lcore_job_register(struct wlb_lcore_job *lcore_job, wlb_cpu_lcore_role_t
     return EWLB_OK;
 }
 
-void wlb_lcore_start(int master) {
+int wlb_lcore_start(int master) {
     if (master) {
-        rte_eal_mp_remote_launch(wlb_job_loop, NULL, CALL_MAIN);
-        return;
+        return wlb_job_loop(NULL);
+
     }
-    rte_eal_mp_remote_launch(wlb_job_loop, NULL, SKIP_MAIN);
+    return rte_eal_mp_remote_launch(wlb_job_loop, NULL, SKIP_MAIN);
 }
 
 int wlb_scheduler_init(void) {

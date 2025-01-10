@@ -3,6 +3,9 @@ bin/*
 .vscode
 dpdk/dpdk-stable-20.11.1/*
 dpdk/dpdklib/
+test/*
+src/wlb
+core.*
 # 保留 bin/ 目录本身（可选）
 !bin/
 

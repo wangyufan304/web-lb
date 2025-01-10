@@ -22,8 +22,7 @@ struct wlb_lcore_job_array
   wlb_cpu_lcore_role_t role;
 }__rte_cache_aligned;
 
-void
-wlb_lcore_start(int master);
+int wlb_lcore_start(int master);
 int wlb_scheduler_init(void);
 int wlb_scheduler_term(void);
 int wlb_lcore_job_register(struct wlb_lcore_job *lcore_job, wlb_cpu_lcore_role_t role);

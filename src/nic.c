@@ -78,7 +78,7 @@ static struct rte_eth_conf default_port_conf = {
         .rx_adv_conf = {
                 .rss_conf = {
                         .rss_key = NULL,
-                        .rss_hf  = /*ETH_RSS_IP*/ ETH_RSS_TCP,
+                        .rss_hf  = ETH_RSS_IP | ETH_RSS_TCP | ETH_RSS_UDP,
                 },
         },
         .txmode = {
@@ -201,9 +201,9 @@ int nic_port_init(void) {
     if (nports <= 0)
         rte_exit(EXIT_FAILURE, "No dpdk ports found!\n"
                                "Possibly nic or driver is not dpdk-compatible.\n");
-    this_eth_conf = port_default_conf;
+    this_eth_conf = default_port_conf;
     for(pid = 0; pid<nports;pid++){
-        port = nic_port_alloc(pid,0,0,&this_eth_conf);
+        port = nic_port_alloc(pid,8,8,&this_eth_conf);
         hz_nic_ports[pid] = port;
         if(!port){
             rte_exit(EXIT_FAILURE, "Port allocate fail, exiting...\n");

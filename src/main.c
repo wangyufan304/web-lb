@@ -4,13 +4,11 @@
 
 #include <pthread.h>
 #include <rte_eal.h>
-#include "link_layer.h"
-#include "tools.h"
-#include "global_data.h"
-#include "common.h"
-#include "pidfile.h"
-#include "schedule.h"
-#include "nic.h"
+#include "../include/link_layer.h"
+#include "../include/tools.h"
+#include "../include/pidfile.h"
+#include "../include/schedule.h"
+#include "../include/nic.h"
 
 #define WLB_MODULES                                      \
 {                                                        \
@@ -104,7 +102,6 @@ static void modules_term(void) {
 }
 
 int main(int argc, char *argv[]) {
-    unsigned lcore_id;
     int nports;
     int err;
     struct nic_port *dev;
@@ -122,21 +119,22 @@ int main(int argc, char *argv[]) {
     if (set_all_thread_affinity() != 0) {
         fprintf(stderr, "set_all_thread_affinity failed\n");
         exit(EXIT_FAILURE);
-    }else{
+    } else {
         fprintf(stdout, "set_all_thread_affinity success\n");
     }
     nports = rte_eth_dev_count_avail();
-    for(pid = 0;pid<nports;pid++){
+    for (pid = 0; pid < nports; pid++) {
         dev = get_nic_ports(pid);
-        if(dev == NULL){
+        if (dev == NULL) {
             continue;
         }
         err = nic_port_start(dev);
-        if(err!=EWLB_OK){
-            printf("START ERROR %s\n",dev->nic_name);
+        if (err != EWLB_OK) {
+            printf("START ERROR %s\n", dev->nic_name);
         }
     }
     printf("port init successfully!\n");
-    wlb_lcore_start(1);
     wlb_lcore_start(0);
+    wlb_lcore_start(1);
+
 }

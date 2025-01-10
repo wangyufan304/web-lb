@@ -2,7 +2,7 @@
 #define __WLB_COMMON_H__
 
 #include <bits/stdint-uintn.h>
-
+#include "debug.h"
 #define WLB_MAX_SOCKET 2
 
 #define NIC_MAX_PKT_BURST 32
